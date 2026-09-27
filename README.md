@@ -339,6 +339,52 @@ Snapshot with problems:
 lists are rotated to start at the smallest span id. Unknown trace id →
 `404`.
 
+### `GET /api/v1/traces/{trace_id}/dominant-path` — heaviest root-to-leaf chain
+
+Finds the parent/child call chain that dominates the trace's latency. Each
+span's **weight** is its own `[start, end)` length minus the union of the
+intersections with its **direct** children's intervals (the same
+exclusive-time rule as `/service-time`): children that overlap each other
+are subtracted only once, and only the part of a child interval that lies
+inside the parent counts. Spans whose `parent_span_id` never arrived are
+treated as roots, so the snapshot forms a forest; the weights along every
+root-to-leaf path are summed and the heaviest path wins. Ties are broken by
+the lexicographically smallest span-id sequence. Works on open traces too —
+computed from a consistent snapshot of the spans received so far.
+
+```bash
+curl -s http://localhost:8080/api/v1/traces/abc-123/dominant-path
+```
+
+```json
+{
+  "trace_id": "abc-123",
+  "span_count": 4,
+  "total_weight_ns": 2000000000,
+  "path": [
+    { "span_id": "root",   "weight_ns": 400000000 },
+    { "span_id": "charge", "weight_ns": 1100000000 },
+    { "span_id": "db",     "weight_ns": 500000000 }
+  ]
+}
+```
+
+`path` lists the winning chain root-first with each node's own weight;
+`total_weight_ns` is their sum. Unknown trace id → `404`. A snapshot with
+**self-references or parent/child cycles** has no root-to-leaf paths and
+returns `422` with the spans involved:
+
+```json
+{
+  "detail": {
+    "error": "cyclic_parent_references",
+    "message": "cyclic parent references among spans: c1, c2, loop",
+    "self_references": ["loop"],
+    "cycles": [["c1", "c2"]]
+  }
+}
+```
+
 ### Other endpoints
 
 | Method & path | Purpose |
@@ -411,5 +457,6 @@ The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
 queries, timestamp formats, per-service exclusive-time computation,
 concurrent-span window detection, trace integrity checks (missing parent,
-self reference, cycles, time-boundary violations) and crash recovery from
-SQLite.
+self reference, cycles, time-boundary violations), dominant-path selection
+(weights, tie-breaking, orphan roots, cyclic-reference 422s) and crash
+recovery from SQLite.

@@ -7,6 +7,7 @@ from app.timeutil import minute_bucket, to_ns
 from app.sampler import hash_score, select_by_hash, stable_hash
 from app.servicetime import exclusive_by_service, _union_length
 from app.concurrency import active_windows
+from app.dominantpath import CyclicReferenceError, dominant_path
 from app.integrity import (
     CYCLE,
     MISSING_PARENT,
@@ -430,3 +431,163 @@ def test_integrity_anomaly_ordering_is_deterministic():
     ]
     # Re-running yields identical output.
     assert check_integrity(rows) == check_integrity(list(rows))
+
+
+# ------------------------------------------------------------- dominant path
+
+def _path_ids(result):
+    return [node["span_id"] for node in result["path"]]
+
+
+def test_dominant_path_single_chain_weights():
+    rows = [
+        _row("root", 0, 100),
+        _row("mid", 10, 90, parent="root"),
+        _row("leaf", 20, 80, parent="mid"),
+    ]
+    result = dominant_path(rows)
+    assert result["span_count"] == 3
+    assert _path_ids(result) == ["root", "mid", "leaf"]
+    # root 20, mid 20, leaf 60 -> total equals the trace wall-clock length.
+    assert [n["weight_ns"] for n in result["path"]] == [20, 20, 60]
+    assert result["total_weight_ns"] == 100
+
+
+def test_dominant_path_picks_heaviest_branch():
+    rows = [
+        _row("root", 0, 100),
+        _row("light", 0, 10, parent="root"),
+        _row("heavy", 10, 90, parent="root"),
+    ]
+    result = dominant_path(rows)
+    # root exclusive 10; heavy branch 10 + 80 beats light branch 10 + 10.
+    assert _path_ids(result) == ["root", "heavy"]
+    assert result["total_weight_ns"] == 90
+
+
+def test_dominant_path_overlapping_children_subtracted_once():
+    rows = [
+        _row("root", 0, 100),
+        _row("a", 10, 60, parent="root"),
+        _row("b", 40, 90, parent="root"),
+    ]
+    result = dominant_path(rows)
+    # Children union [10, 90) -> root weight 20; a branch totals 20 + 50.
+    assert _path_ids(result) == ["root", "a"]
+    assert result["path"][0]["weight_ns"] == 20
+    assert result["total_weight_ns"] == 70
+
+
+def test_dominant_path_child_beyond_parent_clipped_to_parent_interval():
+    rows = [
+        _row("root", 10, 50),
+        _row("wide", 0, 100, parent="root"),
+    ]
+    result = dominant_path(rows)
+    # Only the part inside the parent is subtracted: root weight 0, the
+    # child keeps its full 100 and the path runs through it.
+    assert _path_ids(result) == ["root", "wide"]
+    assert [n["weight_ns"] for n in result["path"]] == [0, 100]
+    assert result["total_weight_ns"] == 100
+
+
+def test_dominant_path_zero_duration_span_has_zero_weight():
+    rows = [
+        _row("root", 0, 100),
+        _row("instant", 50, 50, parent="root"),
+    ]
+    result = dominant_path(rows)
+    assert _path_ids(result) == ["root", "instant"]
+    assert [n["weight_ns"] for n in result["path"]] == [100, 0]
+
+
+def test_dominant_path_missing_parent_span_is_a_root():
+    rows = [
+        _row("root", 0, 100),
+        _row("child", 0, 40, parent="root"),
+        # Orphan chain wins on its own: 200 > 60 + 40.
+        _row("orphan", 0, 200, parent="ghost"),
+    ]
+    result = dominant_path(rows)
+    assert _path_ids(result) == ["orphan"]
+    assert result["total_weight_ns"] == 200
+
+
+def test_dominant_path_tie_broken_by_lexicographic_span_id_sequence():
+    # Two roots with identical weight: the smaller span id wins.
+    rows = [_row("r2", 0, 100), _row("r1", 0, 100)]
+    assert _path_ids(dominant_path(rows)) == ["r1"]
+
+    # Equal-total branches under one root: compare the whole sequence.
+    rows = [
+        _row("root", 0, 100),
+        _row("b", 0, 50, parent="root"),
+        _row("a", 50, 100, parent="root"),
+    ]
+    # root weight 0, both branches total 50: [root, a] < [root, b].
+    assert _path_ids(dominant_path(rows)) == ["root", "a"]
+
+
+def test_dominant_path_tie_uses_full_sequence_not_just_first_id():
+    rows = [
+        _row("root", 0, 100),
+        _row("a", 0, 50, parent="root"),
+        _row("z", 0, 50, parent="a"),
+        _row("b", 50, 100, parent="root"),
+    ]
+    # root weight 0, a weight 0, z 50, b 50: both branches total 50 and
+    # [root, a, z] < [root, b] even though the deeper chain has more nodes.
+    result = dominant_path(rows)
+    assert _path_ids(result) == ["root", "a", "z"]
+    assert result["total_weight_ns"] == 50
+
+
+def test_dominant_path_self_reference_raises_with_span_id():
+    rows = [
+        _row("root", 0, 100),
+        _row("loop", 0, 10, parent="loop"),
+    ]
+    with pytest.raises(CyclicReferenceError) as excinfo:
+        dominant_path(rows)
+    assert excinfo.value.self_references == ["loop"]
+    assert excinfo.value.cycles == []
+    assert "loop" in str(excinfo.value)
+
+
+def test_dominant_path_cycle_raises_with_ring_members():
+    rows = [
+        _row("in", 0, 10, parent="x"),
+        _row("x", 0, 10, parent="y"),
+        _row("y", 0, 10, parent="z"),
+        _row("z", 0, 10, parent="x"),
+    ]
+    with pytest.raises(CyclicReferenceError) as excinfo:
+        dominant_path(rows)
+    assert excinfo.value.self_references == []
+    # Ring reported once, rotated to start at the smallest span id.
+    assert excinfo.value.cycles == [["x", "y", "z"]]
+
+
+def test_dominant_path_self_reference_and_cycle_reported_together():
+    rows = [
+        _row("loop", 0, 10, parent="loop"),
+        _row("c1", 0, 10, parent="c2"),
+        _row("c2", 0, 10, parent="c1"),
+        _row("ok", 0, 10),
+    ]
+    with pytest.raises(CyclicReferenceError) as excinfo:
+        dominant_path(rows)
+    assert excinfo.value.self_references == ["loop"]
+    assert excinfo.value.cycles == [["c1", "c2"]]
+
+
+def test_dominant_path_deep_chain_does_not_recurse():
+    # 1500 nested spans would blow the recursion limit if the walk were
+    # recursive.
+    rows = [
+        _row(f"s{i}", i, 2000, parent=f"s{i-1}" if i else None)
+        for i in range(1500)
+    ]
+    result = dominant_path(rows)
+    assert len(result["path"]) == 1500
+    assert result["total_weight_ns"] == 2000

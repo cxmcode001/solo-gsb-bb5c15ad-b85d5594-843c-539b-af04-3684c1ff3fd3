@@ -20,6 +20,7 @@ import threading
 from typing import Any
 
 from . import concurrency
+from . import dominantpath
 from . import integrity
 from . import sampler
 from . import servicetime
@@ -404,6 +405,23 @@ class SamplingEngine:
                 "total_concurrent_ns": sum(w["duration_ns"] for w in windows),
                 "windows": windows,
             }
+
+    def get_dominant_path(self, tid: str) -> dict[str, Any] | None:
+        """Heaviest root-to-leaf span chain from one consistent snapshot.
+
+        Works for decided and open traces alike; for open traces the snapshot
+        spans exactly what has been received at query time (the engine lock
+        serializes against ingest). Returns None for unknown traces. Raises
+        dominantpath.CyclicReferenceError when the snapshot contains
+        self-references or parent/child cycles.
+        """
+        with self._lock:
+            if self.storage.get_trace(tid) is None:
+                return None
+            rows = list(self.storage.iter_span_rows(tid))
+            result = dominantpath.dominant_path(rows)
+            result["trace_id"] = tid
+            return result
 
     def get_integrity(self, tid: str) -> dict[str, Any] | None:
         """Reference and time-boundary checks from one consistent snapshot.

@@ -504,3 +504,120 @@ def test_decisions_survive_engine_restart(client, tmp_path):
     assert eng2.stats()["open_traces"] == 0
     assert eng2.stats()["pending_normal"] == 0
     st2.close()
+
+
+def test_dominant_path_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/dominant-path")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_dominant_path_open_trace_uses_current_snapshot(client):
+    tid = "dp-open"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="gateway"),
+        _custom_span(tid, "a", 10, 50, service="auth", parent_span_id="root"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 200
+    body = resp.json()
+    ms = 10**6
+    assert body["trace_id"] == tid
+    assert body["span_count"] == 2
+    # root 100 - 40 = 60, leaf a = 40: the only chain totals 100ms.
+    assert body["path"] == [
+        {"span_id": "root", "weight_ns": 60 * ms},
+        {"span_id": "a", "weight_ns": 40 * ms},
+    ]
+    assert body["total_weight_ns"] == 100 * ms
+
+    # A second child splits the root's exclusive time; both branches tie at
+    # 60ms and the lexicographically smaller span-id sequence wins.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "b", 50, 90, service="auth", parent_span_id="root"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/dominant-path").json()
+    assert body["span_count"] == 3
+    assert body["path"] == [
+        {"span_id": "root", "weight_ns": 20 * ms},
+        {"span_id": "a", "weight_ns": 40 * ms},
+    ]
+    assert body["total_weight_ns"] == 60 * ms
+
+
+def test_dominant_path_heaviest_branch_and_orphan_root(client):
+    tid = "dp-branches"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="gateway"),
+        _custom_span(tid, "light", 0, 10, service="cache",
+                     parent_span_id="root"),
+        _custom_span(tid, "heavy", 10, 90, service="db",
+                     parent_span_id="root"),
+        # Orphan (parent never arrived) is a root of its own, but its 50ms
+        # loses against the heavy branch (10 + 80 = 90ms).
+        _custom_span(tid, "orphan", 0, 50, service="cache",
+                     parent_span_id="ghost"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 200
+    body = resp.json()
+    ms = 10**6
+    assert body["span_count"] == 4
+    assert body["path"] == [
+        {"span_id": "root", "weight_ns": 10 * ms},
+        {"span_id": "heavy", "weight_ns": 80 * ms},
+    ]
+    assert body["total_weight_ns"] == 90 * ms
+
+
+def test_dominant_path_self_reference_is_422_and_lists_span(client):
+    tid = "dp-selfref"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "loop", 0, 10, service="svc",
+                     parent_span_id="loop"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "cyclic_parent_references"
+    assert detail["self_references"] == ["loop"]
+    assert detail["cycles"] == []
+    assert "loop" in detail["message"]
+
+
+def test_dominant_path_cycle_is_422_and_lists_members(client):
+    tid = "dp-cycle"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "ok", 0, 10, service="svc"),
+        _custom_span(tid, "c1", 0, 10, service="svc", parent_span_id="c2"),
+        _custom_span(tid, "c2", 0, 10, service="svc", parent_span_id="c1"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "cyclic_parent_references"
+    assert detail["self_references"] == []
+    assert detail["cycles"] == [["c1", "c2"]]
+    assert "c1" in detail["message"] and "c2" in detail["message"]
+
+
+def test_dominant_path_422_lists_self_reference_and_cycle_together(client):
+    tid = "dp-mixed"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "loop", 0, 10, service="svc",
+                     parent_span_id="loop"),
+        _custom_span(tid, "x", 0, 10, service="svc", parent_span_id="y"),
+        _custom_span(tid, "y", 0, 10, service="svc", parent_span_id="x"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["self_references"] == ["loop"]
+    assert detail["cycles"] == [["x", "y"]]

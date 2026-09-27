@@ -116,6 +116,21 @@ class ConcurrencyResponse(BaseModel):
     windows: list[ConcurrencyWindow]
 
 
+class DominantPathNode(BaseModel):
+    span_id: str
+    # Exclusive ns: own [start, end) length minus direct-child coverage.
+    weight_ns: int
+
+
+class DominantPathResponse(BaseModel):
+    trace_id: str
+    span_count: int
+    # Sum of the node weights along the winning path.
+    total_weight_ns: int
+    # The heaviest root-to-leaf path, root first.
+    path: list[DominantPathNode]
+
+
 class IntegrityAnomaly(BaseModel):
     # missing_parent  - parent_span_id names a span the trace never received
     # self_reference  - a span lists itself as its parent
