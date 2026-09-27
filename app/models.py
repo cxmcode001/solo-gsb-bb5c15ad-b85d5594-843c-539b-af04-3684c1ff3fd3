@@ -149,6 +149,17 @@ class IntegrityResponse(BaseModel):
     anomalies: list[IntegrityAnomaly]
 
 
+class DominantPathResponse(BaseModel):
+    trace_id: str
+    span_count: int
+    # Span ids of the heaviest root-to-leaf chain, root first.
+    path: list[str]
+    # Exclusive weight of each node on `path`, aligned position by position;
+    # the entries sum to total_weight_ns.
+    weights_ns: list[int]
+    total_weight_ns: int
+
+
 class StatsResponse(BaseModel):
     open_traces: int
     pending_normal: int

@@ -468,6 +468,131 @@ def test_integrity_works_after_trace_close(client):
     assert anomaly["start_overflow_ns"] == 0
 
 
+def test_dominant_path_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/dominant-path")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_dominant_path_open_trace_follows_snapshot(client):
+    tid = "dp-open"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="gateway"),
+        _custom_span(tid, "a", 10, 50, service="auth", parent_span_id="root"),
+    ]})
+
+    ms = 10**6
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["trace_id"] == tid
+    assert body["span_count"] == 2
+    # root: 100 - 40 = 60; a: 40 -> total 100.
+    assert body["path"] == ["root", "a"]
+    assert body["weights_ns"] == [60 * ms, 40 * ms]
+    assert body["total_weight_ns"] == 100 * ms
+
+    # A heavier second branch flips the dominant chain on re-query.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "b", 50, 95, service="billing",
+                     parent_span_id="root"),
+        _custom_span(tid, "b1", 55, 90, service="billing-db",
+                     parent_span_id="b"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/dominant-path").json()
+    assert body["span_count"] == 4
+    # root: 100 - 85 = 15; b: 45 - 35 = 10; b1: 35 -> 60 beats root->a = 55.
+    assert body["path"] == ["root", "b", "b1"]
+    assert body["weights_ns"] == [15 * ms, 10 * ms, 35 * ms]
+    assert body["total_weight_ns"] == 60 * ms
+
+
+def test_dominant_path_tie_breaks_to_smallest_span_id_sequence(client):
+    tid = "dp-tie"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "b", 0, 50, service="svc", parent_span_id="root"),
+        _custom_span(tid, "a", 50, 100, service="svc", parent_span_id="root"),
+    ]})
+
+    ms = 10**6
+    body = client.get(f"/api/v1/traces/{tid}/dominant-path").json()
+    # Both branches total 50ms; the lexicographically smaller sequence wins.
+    assert body["path"] == ["root", "a"]
+    assert body["weights_ns"] == [0, 50 * ms]
+    assert body["total_weight_ns"] == 50 * ms
+
+
+def test_dominant_path_missing_parent_span_is_treated_as_root(client):
+    tid = "dp-orphan"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "orphan", 0, 100, service="svc",
+                     parent_span_id="ghost"),
+        _custom_span(tid, "c", 10, 60, service="svc", parent_span_id="orphan"),
+        _custom_span(tid, "r", 0, 80, service="svc"),
+    ]})
+
+    ms = 10**6
+    body = client.get(f"/api/v1/traces/{tid}/dominant-path").json()
+    # orphan->c = 50 + 50 = 100 beats the real root r = 80.
+    assert body["path"] == ["orphan", "c"]
+    assert body["weights_ns"] == [50 * ms, 50 * ms]
+    assert body["total_weight_ns"] == 100 * ms
+
+
+def test_dominant_path_self_reference_is_422_with_span_ids(client):
+    tid = "dp-self"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "loop", 10, 20, service="svc",
+                     parent_span_id="loop"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["span_ids"] == ["loop"]
+    assert detail["self_references"] == ["loop"]
+    assert detail["cycles"] == []
+    assert "loop" in detail["message"]
+
+
+def test_dominant_path_cycle_is_422_and_lists_ring_members(client):
+    tid = "dp-cycle"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        # Lead-in chain reaches the ring but is not implicated.
+        _custom_span(tid, "in", 0, 5, service="svc", parent_span_id="x"),
+        _custom_span(tid, "x", 0, 10, service="svc", parent_span_id="y"),
+        _custom_span(tid, "y", 0, 10, service="svc", parent_span_id="z"),
+        _custom_span(tid, "z", 0, 10, service="svc", parent_span_id="x"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["span_ids"] == ["x", "y", "z"]
+    assert detail["self_references"] == []
+    assert detail["cycles"] == [["x", "y", "z"]]
+
+
+def test_dominant_path_works_after_trace_close(client):
+    tid = "dp-closed"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="svc"),
+        _custom_span(tid, "a", 10, 90, service="svc", parent_span_id="root"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+
+    ms = 10**6
+    resp = client.get(f"/api/v1/traces/{tid}/dominant-path")
+    assert resp.status_code == 200
+    body = resp.json()
+    # root: 100 - 80 = 20; a: 80 -> total 100.
+    assert body["path"] == ["root", "a"]
+    assert body["weights_ns"] == [20 * ms, 80 * ms]
+    assert body["total_weight_ns"] == 100 * ms
+
+
 def test_decisions_survive_engine_restart(client, tmp_path):
     from app.config import Settings
     from app.engine import SamplingEngine

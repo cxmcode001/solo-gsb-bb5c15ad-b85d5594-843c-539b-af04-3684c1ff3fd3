@@ -8,6 +8,7 @@ import logging
 from fastapi import FastAPI, HTTPException, Query
 
 from .config import settings
+from .dominantpath import CyclicTraceError
 from .engine import SamplingEngine
 from .models import (
     BatchDecisionRequest,
@@ -16,6 +17,7 @@ from .models import (
     BatchIngestResponse,
     ConcurrencyResponse,
     DecisionResponse,
+    DominantPathResponse,
     IntegrityResponse,
     ServiceTimeResponse,
     StatsResponse,
@@ -90,6 +92,7 @@ def root() -> dict[str, str]:
         "service_time": "GET /api/v1/traces/{trace_id}/service-time",
         "concurrency": "GET /api/v1/traces/{trace_id}/concurrency?min_active=2",
         "integrity": "GET /api/v1/traces/{trace_id}/integrity",
+        "dominant_path": "GET /api/v1/traces/{trace_id}/dominant-path",
     }
 
 
@@ -181,9 +184,32 @@ def get_integrity(trace_id: str) -> IntegrityResponse:
     return IntegrityResponse(**view)
 
 
+@app.get(
+    "/api/v1/traces/{trace_id}/dominant-path",
+    response_model=DominantPathResponse,
+    tags=["traces"],
+    summary="Heaviest root-to-leaf call chain of one trace",
+)
+def get_dominant_path(trace_id: str) -> DominantPathResponse:
+    try:
+        view = get_engine().get_dominant_path(trace_id)
+    except CyclicTraceError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "span_ids": exc.span_ids,
+                "self_references": exc.self_references,
+                "cycles": exc.cycles,
+            },
+        ) from exc
+    if view is None:
+        raise HTTPException(status_code=404, detail="trace not found")
+    return DominantPathResponse(**view)
+
+
 @app.get("/api/v1/stats", response_model=StatsResponse, tags=["admin"])
-def stats() -> StatsResponse:
-    return StatsResponse(**get_engine().stats())
+def stats() -> StatsResponse:    return StatsResponse(**get_engine().stats())
 
 
 @app.post("/api/v1/admin/force-flush", tags=["admin"],

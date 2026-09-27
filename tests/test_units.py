@@ -14,6 +14,7 @@ from app.integrity import (
     TIME_OUT_OF_BOUNDS,
     check_integrity,
 )
+from app.dominantpath import CyclicTraceError, dominant_path
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -430,3 +431,175 @@ def test_integrity_anomaly_ordering_is_deterministic():
     ]
     # Re-running yields identical output.
     assert check_integrity(rows) == check_integrity(list(rows))
+
+
+# ------------------------------------------------------------ dominant path
+
+def test_dominant_path_single_span_is_its_own_chain():
+    assert dominant_path([_row("only", 5, 40)]) == {
+        "path": ["only"],
+        "weights_ns": [35],
+        "total_weight_ns": 35,
+    }
+
+
+def test_dominant_path_empty_snapshot():
+    assert dominant_path([]) == {
+        "path": [],
+        "weights_ns": [],
+        "total_weight_ns": 0,
+    }
+
+
+def test_dominant_path_picks_heaviest_branch():
+    rows = [
+        _row("root", 0, 100),
+        _row("a", 10, 50, parent="root"),   # weight 40
+        _row("b", 60, 95, parent="root"),   # weight 35
+    ]
+    # root: 100 - 75 = 25; root->a = 65 beats root->b = 60.
+    assert dominant_path(rows) == {
+        "path": ["root", "a"],
+        "weights_ns": [25, 40],
+        "total_weight_ns": 65,
+    }
+
+
+def test_dominant_path_nested_chain_sums_to_wall_clock():
+    rows = [
+        _row("root", 0, 100),
+        _row("mid", 10, 90, parent="root"),
+        _row("leaf", 20, 80, parent="mid"),
+        _row("side", 40, 60, parent="root"),
+    ]
+    # root 20, mid 20, leaf 60 -> 100 beats root->side = 40.
+    assert dominant_path(rows) == {
+        "path": ["root", "mid", "leaf"],
+        "weights_ns": [20, 20, 60],
+        "total_weight_ns": 100,
+    }
+
+
+def test_dominant_path_overlapping_children_subtracted_once():
+    rows = [
+        _row("root", 0, 100),
+        _row("c1", 10, 60, parent="root"),
+        _row("c2", 50, 80, parent="root"),
+    ]
+    # Union [10, 80) counts once: root weight 100 - 70 = 30.
+    assert dominant_path(rows) == {
+        "path": ["root", "c1"],
+        "weights_ns": [30, 50],
+        "total_weight_ns": 80,
+    }
+
+
+def test_dominant_path_out_of_bounds_child_is_clipped():
+    rows = [
+        _row("root", 10, 50),
+        _row("wide", 0, 100, parent="root"),
+    ]
+    # Only the part inside the parent is deducted: root weight 0.
+    assert dominant_path(rows) == {
+        "path": ["root", "wide"],
+        "weights_ns": [0, 100],
+        "total_weight_ns": 100,
+    }
+
+
+def test_dominant_path_missing_parent_span_becomes_a_root():
+    rows = [
+        _row("orphan", 0, 100, parent="ghost"),
+        _row("c", 10, 60, parent="orphan"),
+        _row("r", 0, 80),
+    ]
+    # orphan->c = 50 + 50 = 100 beats the real root r = 80.
+    assert dominant_path(rows) == {
+        "path": ["orphan", "c"],
+        "weights_ns": [50, 50],
+        "total_weight_ns": 100,
+    }
+
+
+def test_dominant_path_tie_breaks_to_lexicographically_smallest_sequence():
+    rows = [
+        _row("root", 0, 100),
+        _row("b", 0, 50, parent="root"),
+        _row("a", 50, 100, parent="root"),
+    ]
+    # root weight 0; both branches total 50 -> ["root", "a"] wins.
+    assert dominant_path(rows) == {
+        "path": ["root", "a"],
+        "weights_ns": [0, 50],
+        "total_weight_ns": 50,
+    }
+
+
+def test_dominant_path_tie_between_roots():
+    rows = [
+        _row("b", 0, 10),
+        _row("a", 0, 10),
+    ]
+    assert dominant_path(rows) == {
+        "path": ["a"],
+        "weights_ns": [10],
+        "total_weight_ns": 10,
+    }
+
+
+def test_dominant_path_zero_duration_span_weighs_zero():
+    rows = [
+        _row("root", 0, 100),
+        _row("instant", 50, 50, parent="root"),
+    ]
+    # The empty child interval deducts nothing and adds nothing.
+    assert dominant_path(rows) == {
+        "path": ["root", "instant"],
+        "weights_ns": [100, 0],
+        "total_weight_ns": 100,
+    }
+
+
+def test_dominant_path_self_reference_raises_with_span_ids():
+    rows = [
+        _row("root", 0, 100),
+        _row("loop", 10, 20, parent="loop"),
+    ]
+    with pytest.raises(CyclicTraceError) as excinfo:
+        dominant_path(rows)
+    exc = excinfo.value
+    assert exc.span_ids == ["loop"]
+    assert exc.self_references == ["loop"]
+    assert exc.cycles == []
+    assert "loop" in str(exc)
+
+
+def test_dominant_path_cycle_raises_with_ring_members_only():
+    rows = [
+        # Lead-in chain reaches the ring but is not part of it.
+        _row("in", 0, 5, parent="x"),
+        _row("x", 0, 10, parent="y"),
+        _row("y", 0, 10, parent="z"),
+        _row("z", 0, 10, parent="x"),
+    ]
+    with pytest.raises(CyclicTraceError) as excinfo:
+        dominant_path(rows)
+    exc = excinfo.value
+    assert exc.span_ids == ["x", "y", "z"]
+    assert exc.self_references == []
+    assert exc.cycles == [["x", "y", "z"]]
+
+
+def test_dominant_path_self_reference_and_cycle_reported_together():
+    rows = [
+        _row("loop", 0, 10, parent="loop"),
+        _row("a", 0, 10, parent="b"),
+        _row("b", 0, 10, parent="a"),
+        _row("clean", 0, 10),
+    ]
+    with pytest.raises(CyclicTraceError) as excinfo:
+        dominant_path(rows)
+    exc = excinfo.value
+    assert exc.span_ids == ["a", "b", "loop"]
+    assert exc.self_references == ["loop"]
+    assert exc.cycles == [["a", "b"]]

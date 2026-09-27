@@ -339,6 +339,51 @@ Snapshot with problems:
 lists are rotated to start at the smallest span id. Unknown trace id →
 `404`.
 
+### `GET /api/v1/traces/{trace_id}/dominant-path` — heaviest root-to-leaf call chain
+
+Ranks every root-to-leaf parent/child chain of one trace by accumulated
+**exclusive** weight and returns the heaviest one — the call chain that
+dominates the trace's latency. A span's weight is its own `[start, end)`
+length minus the union of its direct children's intersections with it
+(overlapping or out-of-bounds child intervals are subtracted only once and
+only for the part inside the parent interval, so weights never go
+negative). Spans whose parent never arrived are treated as roots. Chains
+tied on total weight are broken by the lexicographically smallest span-id
+sequence. Works on open traces too — computed from a consistent snapshot
+of the spans received so far.
+
+```bash
+curl -s http://localhost:8080/api/v1/traces/abc-123/dominant-path
+```
+
+```json
+{
+  "trace_id": "abc-123",
+  "span_count": 4,
+  "path": ["root", "auth", "auth-db"],
+  "weights_ns": [300000000, 200000000, 450000000],
+  "total_weight_ns": 950000000
+}
+```
+
+* `path` — span ids of the heaviest chain, root first; `weights_ns` is
+  aligned with it position by position and sums to `total_weight_ns`.
+* Unknown trace id → `404`.
+* A snapshot containing self-referencing spans or parent-reference cycles
+  has no root-to-leaf chains → `422` with a `detail` body listing every
+  implicated span id, e.g.:
+
+```json
+{
+  "detail": {
+    "message": "trace has no root-to-leaf call chain (parent cycle: x -> y -> z -> x)",
+    "span_ids": ["x", "y", "z"],
+    "self_references": [],
+    "cycles": [["x", "y", "z"]]
+  }
+}
+```
+
 ### Other endpoints
 
 | Method & path | Purpose |
@@ -411,5 +456,6 @@ The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
 queries, timestamp formats, per-service exclusive-time computation,
 concurrent-span window detection, trace integrity checks (missing parent,
-self reference, cycles, time-boundary violations) and crash recovery from
-SQLite.
+self reference, cycles, time-boundary violations), dominant-path selection
+(weights, tie-breaking, missing-parent roots, cycle/self-reference
+rejection) and crash recovery from SQLite.
